@@ -1,212 +1,139 @@
-import { OpenRouter } from '@openrouter/sdk'
+import OpenAI from "openai"
 import { eq } from 'drizzle-orm'
-import { createDb, searchCache, allocationCache, contentCache } from './db/index.js'
-import dotenv from 'dotenv'
+import { searchCache, allocationCache, contentCache } from './db/index.js'
 
-dotenv.config()
-// Load .env from project root
-// const __filename = fileURLToPath(import.meta.url);
-// const __dirname = dirname(__filename);
-// dotenv.config({ path: resolve(__dirname, '../../.env') });
+const apiKey = import.meta.env.MAIN_VITE_OPENROUTER_API_KEY;
 
-const openRouter = new OpenRouter({
-  apiKey: process.env.OPENROUTER_API_KEY
+const openai = new OpenAI({
+  baseURL: "https://openrouter.ai/api/v1",
+  apiKey: apiKey,
+  defaultHeaders: {
+    "HTTP-Referer": "http://localhost:3000", 
+    "X-Title": "Skill Roadmap App",         
+  }
 })
 
-// Search for different categories (if possible) or generic beginner, intermediate, advanced
-const searchOpenRouter = async (db, skill, level_description, end_goal) => {
-  // Check cache first
-  const cached = await db.select().from(searchCache).where(eq(searchCache.skill, skill)).get()
-
-  if (cached) {
-    console.log('Cache hit for skill:', skill)
-    return JSON.parse(cached.response)
-  }
-
-  const difficultyPrompt = `Search and find the list of intermediate difficulty tiers/ranks for 
-    the skill of ${skill}, given that the user describes themselves with ${level_description}
-    and is for the end goal the user wants ${end_goal}, 
-    Organize into the format { ranking: [ranks]} such as for rock climbing if the user is level v4 and wants to 
-    reach v7 there is { ranking: [v4, v5, v6, v7] }. If there are no standard tiers use general skills that the user 
-    should be able to perform until they reach their end goal`
-
-  // Not in cache, make API call
-  const response = await openRouter.chat.send({
-    model: 'google/gemini-3-flash-preview',
-    messages: [
-      {
-        role: 'user',
-        content: difficultyPrompt
-      }
-    ],
-    stream: false,
-    responseFormat: {
-      type: 'json_object'
+async function callAI(prompt) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "google/gemini-2.0-flash", 
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 2000, // Reduced to prevent balance reservation errors (402)
+    });
+    return JSON.parse(response.choices[0].message.content);
+  } catch (err) {
+    if (err.status === 429) {
+      throw new Error("AI is busy (Rate Limited). Please wait 10 seconds.");
     }
-  })
+    throw err;
+  }
+}
 
-  const target = JSON.parse(response.choices[0].message.content)
+const searchOpenRouter = async (db, skill, level_description, end_goal) => {
+  const cached = await db.select().from(searchCache).where(eq(searchCache.skill, skill)).get()
+  if (cached) return JSON.parse(cached.response)
 
-  // Store in cache
+  const prompt = `Identify 3 difficulty tiers for learning ${skill}. 
+    User current level: ${level_description}. Goal: ${end_goal}.
+    Return JSON: { "ranking": ["Tier 1", "Tier 2", "Tier 3"] }`;
+
+  const target = await callAI(prompt);
+
+  // FIX: UPSERT logic for searchCache
   await db.insert(searchCache).values({
     skill,
     response: JSON.stringify(target),
     createdAt: new Date()
-  })
+  }).onConflictDoUpdate({
+    target: searchCache.skill,
+    set: { response: JSON.stringify(target), createdAt: new Date() }
+  });
 
-  console.log('Cached response for skill:', skill)
   return target
 }
 
-// Search for lower-level skill for the target skill and place them into the given tiers
 const allocationSkillAgent = async (db, topic, tiers) => {
-  // Create cache key from parameters
   const cacheKey = `${topic}:${JSON.stringify(tiers)}`
+  const cached = await db.select().from(allocationCache).where(eq(allocationCache.cacheKey, cacheKey)).get()
+  if (cached) return JSON.parse(cached.response)
 
-  // Check cache first
-  const cached = await db
-    .select()
-    .from(allocationCache)
-    .where(eq(allocationCache.cacheKey, cacheKey))
-    .get()
+  const prompt = `For ${topic}, map exactly 2-3 specific skills to each of these tiers: ${tiers.join(', ')}. 
+    Return JSON: { "roadmap": { "${tiers[0]}": ["skill A", "skill B"], ... } }`;
 
-  if (cached) {
-    console.log('Cache hit for allocation:', topic)
-    return JSON.parse(cached.response)
-  }
-
-  // 1. Find overall list of technical skill
-  const skillPrompt = `Search and find a list of technical skills related to learning the skill of ${topic}.
-    Output the format in { skills: [...]}. Include skills used across all people of varying experience for the skill.
-    For example for rock climbing one could learn crimping, hip positioning, etc.`
-  const skillResponse = await openRouter.chat.send({
-    model: 'google/gemini-3-flash-preview',
-    messages: [
-      {
-        role: 'user',
-        content: skillPrompt
-      }
-    ],
-    stream: false,
-    responseFormat: {
-      type: 'json_object'
-    }
-  })
-  const skillTarget = JSON.parse(skillResponse.choices[0].message.content)
-
-  // 2. Catergorise which skill belongs to which difficulty (search) (5-6 max), and determine percentage time for each skill
-  const catergorizationPrompt = `For the topic of ${topic} consider the skill list : ${skillTarget.skill} and the tiers/ranks ${tiers}.
-    Search the web for context on each tier and for each tier, place skills that would necessary and optimal to learn at that skill. Skills
-    don't have to be uniquely placed within a tier and can exist within multiple tiers. Output the format in
-    { tier1: [skill1, skill4, ...], tier2: [skill2, skill4, ...], ...}`
-  const catergorizationResponse = await openRouter.chat.send({
-    model: 'google/gemini-3-flash-preview',
-    messages: [
-      {
-        role: 'user',
-        content: catergorizationPrompt
-      }
-    ],
-    stream: false,
-    responseFormat: {
-      type: 'json_object'
-    }
-  })
-  const catergorizationTarget = JSON.parse(catergorizationResponse.choices[0].message.content)
-
-  const response = {
-    roadmap: catergorizationTarget,
-    node_skills: [...new Set(Object.values(catergorizationTarget).flat())]
-  }
-
-  // Store in cache
+  const response = await callAI(prompt);
+  const target = response.roadmap;
+  const result = { roadmap: target, node_skills: [...new Set(Object.values(target).flat())] }
+  
+  // FIX: UPSERT logic for allocationCache
   await db.insert(allocationCache).values({
     cacheKey,
-    response: JSON.stringify(response),
+    response: JSON.stringify(result),
     createdAt: new Date()
-  })
+  }).onConflictDoUpdate({
+    target: allocationCache.cacheKey,
+    set: { response: JSON.stringify(result), createdAt: new Date() }
+  });
 
-  console.log('Cached response for allocation:', topic)
-  return response
+  return result
 }
 
-// Find content / tips for each skill
 const contentSkill = async (db, topic, skills) => {
-  // Create cache key from parameters
   const cacheKey = `${topic}:${JSON.stringify(skills)}`
+  const cached = await db.select().from(contentCache).where(eq(contentCache.cacheKey, cacheKey)).get()
+  if (cached) return JSON.parse(cached.response)
 
-  // Check cache first
-  const cached = await db
-    .select()
-    .from(contentCache)
-    .where(eq(contentCache.cacheKey, cacheKey))
-    .get()
+  // Optimization: Tell the AI to keep descriptions brief to save tokens
+  const prompt = `For these ${topic} skills: ${skills.join(', ')}, provide details.
+    Keep descriptions under 2 sentences.
+    Return JSON: { "Skill Name": { "description": "...", "tips": ["tip1"], "url": "youtube_link" } }`;
 
-  if (cached) {
-    console.log('Cache hit for content:', topic)
-    return JSON.parse(cached.response)
-  }
+  const target = await callAI(prompt);
 
-  // 3. For each technical skill find content
-  // Content information -> text / tips / youtube -> link
-  const contentPrompt = `For the topic of ${topic} consider the skill list : ${skills}. For each skill web search and find:
-    1. a short description of the skill, 2. 1-3 tips for the skill, 3. a web resource
-    If there is no reasonable resource found for the skill put null. Output the format in
-    { skill1: {description: ..., tips: [...], url: ...}, skill2: ..., ...}`
-  const contentResponse = await openRouter.chat.send({
-    model: 'google/gemini-3-flash-preview',
-    messages: [
-      {
-        role: 'user',
-        content: contentPrompt
-      }
-    ],
-    stream: false,
-    responseFormat: {
-      type: 'json_object'
-    }
-  })
-  const contentTarget = JSON.parse(contentResponse.choices[0].message.content)
-
-  // Store in cache
+  // FIX: UPSERT logic for contentCache
   await db.insert(contentCache).values({
     cacheKey,
-    response: JSON.stringify(contentTarget),
+    response: JSON.stringify(target),
     createdAt: new Date()
-  })
+  }).onConflictDoUpdate({
+    target: contentCache.cacheKey,
+    set: { response: JSON.stringify(target), createdAt: new Date() }
+  });
 
-  console.log('Cached response for content:', topic)
-  return contentTarget
+  return target
 }
 
 export const generateRoadmap = async (db, topic, level_description, end_goal) => {
-  const response = await searchOpenRouter(db, topic, level_description, end_goal)
-  const { roadmap, node_skills } = await allocationSkillAgent(db, topic, response.ranking)
-  const contentResponse = await contentSkill(db, topic, node_skills)
+  try {
+    if (!apiKey) throw new Error("API Key missing");
 
-  const levels = []
-  const keys = Object.keys(roadmap)
+    const response = await searchOpenRouter(db, topic, level_description, end_goal)
+    const { roadmap, node_skills } = await allocationSkillAgent(db, topic, response.ranking)
+    const contentResponse = await contentSkill(db, topic, node_skills)
 
-  for (let i = 0; i < keys.length; ++i) {
-    const skills = roadmap[keys[i]]
-    const parsedSkills = []
-    for (let j = 0; j < skills.length; ++j) {
-      // TODO IF HAVE TIME: fix up formatting to prevent querying
-      // of contentResponse
-      const parsedSkill = {
-        id: `d${i}-s${j}`,
-        name: skills[j],
-        tips: contentResponse[skills[j]].tips,
-        url: contentResponse[skills[j]].url,
-        description: contentResponse[skills[j]].description
-      }
-      parsedSkills.push(parsedSkill)
-    }
-    const layer = {
-      difficulty: i,
-      skills: parsedSkills
-    }
-    levels.push(layer)
+    const startNodes = []
+    const skillNodes = []
+    const tiers = Object.keys(roadmap)
+
+    tiers.forEach((tierName, i) => {
+      startNodes.push({ id: `start-${i}`, levelIndex: i, name: tierName })
+      roadmap[tierName].forEach((skillName, j) => {
+        const details = contentResponse[skillName] || {}
+        skillNodes.push({
+          id: `level-${i}-skill-${j}`,
+          levelIndex: i,
+          name: skillName,
+          description: details.description || "",
+          tips: details.tips || [],
+          youtubeUrl: details.url || null
+        })
+      })
+    })
+
+    return { startNodes, skillNodes }
+    
+  } catch (error) {
+    console.error("Roadmap Pipeline Failed:", error.message)
+    throw error
   }
-  return levels
 }
