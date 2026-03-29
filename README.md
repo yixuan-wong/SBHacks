@@ -1,6 +1,12 @@
-# my-app
+# RoadRunner - AI Learning Path Generator
 
-An Electron application with React
+## Team
+
+Yixuan Wong, Christopher Chau, Michael Wu, Kevin Zhang
+
+## Project 
+
+Learning a new skill is overwhelming. RoadRunner turns any goal into a structured, personalized roadmap with clear milestones, resources, and quizzes, so you always know what to learn next.
 
 ## Recommended IDE Setup
 
